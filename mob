@@ -8,6 +8,7 @@ HEARTBEAT_FRESH=300   # 5 minutes - heartbeat considered fresh
 HEARTBEAT_STALE=900   # 15 minutes - heartbeat considered stale
 HEARTBEAT_DIR="/tmp/mob-heartbeats"
 LOCK_DIR="/tmp/mob-locks"
+LOG_DIR="/tmp/mob-logs"
 
 WORKER_TOOLS="Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch,Task,TodoWrite"
 
@@ -132,8 +133,10 @@ spawn_quiet() {
         return 1
     fi
 
+    mkdir -p "$LOG_DIR"
     tmux new-session -d -s "$name"
     sleep 0.2
+    tmux pipe-pane -t "$name" -o "cat >> '$LOG_DIR/$name.log'"
     tmux send-keys -t "$name" "claude" Enter
     echo "$name"
 }
@@ -569,6 +572,23 @@ peek() {
     tmux capture-pane -t "$session" -p -S "-$lines"
 }
 
+logs() {
+    local session="$1"
+    local lines="${2:-}"
+    local logfile="$LOG_DIR/$session.log"
+
+    if [[ ! -f "$logfile" ]]; then
+        echo "No log file for $session" >&2
+        return 1
+    fi
+
+    if [[ -n "$lines" ]]; then
+        tail -n "$lines" "$logfile"
+    else
+        cat "$logfile"
+    fi
+}
+
 waiting() {
     local sessions
     sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
@@ -598,6 +618,24 @@ waiting() {
     done
 }
 
+watch() {
+    trap 'echo ""; exit 0' INT
+    while true; do
+        clear
+        echo "=== MOB WATCH === $(date '+%H:%M:%S') ==="
+        echo ""
+        health
+        echo ""
+        local waiting_output
+        waiting_output=$(waiting)
+        if [[ -n "$waiting_output" ]]; then
+            echo "WAITING FOR INPUT:"
+            echo "$waiting_output"
+        fi
+        sleep 2
+    done
+}
+
 usage() {
     cat <<EOF
 mob - Orchestrate multiple Claude Code sessions
@@ -623,7 +661,9 @@ COMMANDS:
     broadcast-workers <msg> Send message to all workers only
 
     peek <session> [lines]  Show last N lines from session (default: 30)
+    logs <session> [lines]  Show session log file (optional: last N lines)
     waiting                 Show sessions waiting for input/permission
+    watch                   Live dashboard with auto-refresh (Ctrl+C to exit)
 
     attach <session>        Attach to a session (detach: Ctrl-b d)
 
@@ -713,8 +753,15 @@ main() {
             [[ $# -lt 1 ]] && { echo "Usage: peek <session> [lines]" >&2; exit 1; }
             peek "$@"
             ;;
+        logs)
+            [[ $# -lt 1 ]] && { echo "Usage: logs <session> [lines]" >&2; exit 1; }
+            logs "$@"
+            ;;
         waiting)
             waiting
+            ;;
+        watch)
+            watch
             ;;
         attach)
             [[ $# -lt 1 ]] && { echo "Usage: attach <session>" >&2; exit 1; }
