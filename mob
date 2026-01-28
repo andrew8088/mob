@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SESSION_PREFIX="claude"
+PRIME_DELAY=3  # seconds to wait for Claude to start
+ZOMBIE_GRACE_PERIOD=10  # seconds after session creation before marking as zombie
+
+WORKER_TOOLS="Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch,Task,TodoWrite"
+
+read -r -d '' COORD_PROMPT << 'EOF' || true
+You are a **coordinator** managing Claude Code workers via `mob`. Your job:
+1. Break tasks into independent subtasks
+2. Spawn workers: `mob spawn worker <id>`
+3. Dispatch work: `mob send claude-worker-<id> "<task>. When done: mob done '<summary>'"`
+4. Watch for callbacks: [DONE from ...], [REPORT from ...], [QUESTION from ...]
+5. Synthesize results when all workers complete
+
+Commands: `mob workers` (list), `mob send <session> <msg>`, `mob broadcast-workers <msg>`, `mob kill <session>`
+
+Keep tasks independent. 2-4 workers is optimal. Always tell workers to run `mob done` when finished.
+EOF
+
+read -r -d '' WORKER_PROMPT << 'EOF' || true
+You are a **worker** in a multi-agent swarm. A coordinator assigned you a task.
+
+When finished: `mob done "summary of what you built"`
+If stuck: `mob ask "your question"`
+Progress update: `mob report "status"`
+
+Focus only on your assigned task. Don't wait for confirmation after `mob done`.
+EOF
+
+setup_crash_detection() {
+    local session="$1"
+    local mob_path
+    mob_path=$(realpath "$0")
+    tmux set-hook -t "$session" pane-died "run-shell '$mob_path crash $session'"
+}
+
+spawn() {
+    local role="$1"
+    local id="${2:-$(date +%s)}"
+    local name="${SESSION_PREFIX}-${role}-${id}"
+
+    if tmux has-session -t "$name" 2>/dev/null; then
+        echo "Session $name already exists" >&2
+        return 1
+    fi
+
+    tmux new-session -d -s "$name"
+    sleep 0.2
+
+    if [[ "$role" == "worker"* ]]; then
+        tmux send-keys -t "$name" "claude --allowedTools '$WORKER_TOOLS'" Enter
+        setup_crash_detection "$name"
+    else
+        tmux send-keys -t "$name" "claude" Enter
+    fi
+
+    # Auto-prime based on role
+    if [[ "$role" == "coord"* ]]; then
+        echo "Waiting ${PRIME_DELAY}s for Claude to start..."
+        sleep "$PRIME_DELAY"
+        tmux send-keys -t "$name" -l "$COORD_PROMPT"
+        sleep 0.3
+        tmux send-keys -t "$name" Enter
+        echo "$name (primed as coordinator)"
+    elif [[ "$role" == "worker"* ]]; then
+        echo "Waiting ${PRIME_DELAY}s for Claude to start..."
+        sleep "$PRIME_DELAY"
+        tmux send-keys -t "$name" -l "$WORKER_PROMPT"
+        sleep 0.3
+        tmux send-keys -t "$name" Enter
+        echo "$name (primed as worker, crash detection enabled)"
+    else
+        echo "$name (no auto-prime for role: $role)"
+    fi
+}
+
+spawn_quiet() {
+    local role="$1"
+    local id="${2:-$(date +%s)}"
+    local name="${SESSION_PREFIX}-${role}-${id}"
+
+    if tmux has-session -t "$name" 2>/dev/null; then
+        echo "Session $name already exists" >&2
+        return 1
+    fi
+
+    tmux new-session -d -s "$name"
+    sleep 0.2
+    tmux send-keys -t "$name" "claude" Enter
+    echo "$name"
+}
+
+list_sessions() {
+    tmux list-sessions -F "#{session_name}" 2>/dev/null \
+        | grep "^${SESSION_PREFIX}-" \
+        || echo "No claude sessions running"
+}
+
+workers() {
+    tmux list-sessions -F "#{session_name}" 2>/dev/null \
+        | grep "^${SESSION_PREFIX}-worker" \
+        || echo "No workers running"
+}
+
+coord() {
+    local coord_session
+    coord_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
+        | grep "^${SESSION_PREFIX}-coord" \
+        | head -1 || true)
+
+    if [[ -z "$coord_session" ]]; then
+        echo "No coordinator found" >&2
+        return 1
+    fi
+
+    echo "$coord_session"
+}
+
+report() {
+    local message="$*"
+    local coord_session
+    coord_session=$(coord 2>/dev/null) || {
+        echo "No coordinator to report to" >&2
+        return 1
+    }
+
+    local sender
+    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    tmux send-keys -t "$coord_session" -l "[REPORT from $sender] $message"
+    sleep 0.3
+    tmux send-keys -t "$coord_session" Enter
+
+    echo "Reported to $coord_session"
+}
+
+done_task() {
+    local task_summary="$*"
+    local coord_session
+    coord_session=$(coord 2>/dev/null) || {
+        echo "No coordinator to report to" >&2
+        return 1
+    }
+
+    local sender
+    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    tmux send-keys -t "$coord_session" -l "[DONE from $sender] $task_summary"
+    sleep 0.3
+    tmux send-keys -t "$coord_session" Enter
+
+    echo "Completion reported to $coord_session"
+
+    if [[ "$sender" == "${SESSION_PREFIX}-worker"* ]]; then
+        sleep 1
+        tmux kill-session -t "$sender" 2>/dev/null &
+    fi
+}
+
+ask_coord() {
+    local question="$*"
+    local coord_session
+    coord_session=$(coord 2>/dev/null) || {
+        echo "No coordinator to ask" >&2
+        return 1
+    }
+
+    local sender
+    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    tmux send-keys -t "$coord_session" -l "[QUESTION from $sender] $question"
+    sleep 0.3
+    tmux send-keys -t "$coord_session" Enter
+
+    echo "Question sent to $coord_session"
+}
+
+crash_handler() {
+    local crashed_session="$1"
+    local coord_session
+    coord_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
+        | grep "^${SESSION_PREFIX}-coord" \
+        | head -1 || true)
+
+    if [[ -z "$coord_session" ]]; then
+        echo "Worker $crashed_session crashed (no coordinator to notify)" >&2
+        return 0
+    fi
+
+    if ! tmux has-session -t "$coord_session" 2>/dev/null; then
+        echo "Worker $crashed_session crashed (coordinator session gone)" >&2
+        return 0
+    fi
+
+    tmux send-keys -t "$coord_session" -l "[CRASH from $crashed_session] Worker terminated unexpectedly"
+    sleep 0.3
+    tmux send-keys -t "$coord_session" Enter
+
+    echo "Crash notification sent to $coord_session"
+}
+
+is_claude_running_in_session() {
+    local session="$1"
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$session" -F "#{pane_pid}" 2>/dev/null | head -1)
+
+    if [[ -z "$pane_pid" ]]; then
+        return 1
+    fi
+
+    if ps -o pid,comm -g "$pane_pid" 2>/dev/null | grep -qE "claude|node"; then
+        return 0
+    fi
+
+    local children
+    children=$(pgrep -P "$pane_pid" 2>/dev/null || true)
+    for child in $children; do
+        if ps -o comm= -p "$child" 2>/dev/null | grep -qE "claude|node"; then
+            return 0
+        fi
+        local grandchildren
+        grandchildren=$(pgrep -P "$child" 2>/dev/null || true)
+        for gc in $grandchildren; do
+            if ps -o comm= -p "$gc" 2>/dev/null | grep -qE "claude|node"; then
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+get_session_health() {
+    local session="$1"
+    local created
+    created=$(tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null \
+        | grep "^${session}|" | cut -d'|' -f2)
+
+    local now
+    now=$(date +%s)
+    local age=$((now - created))
+
+    if [[ $age -lt $ZOMBIE_GRACE_PERIOD ]]; then
+        echo "starting"
+        return 0
+    fi
+
+    if is_claude_running_in_session "$session"; then
+        echo "healthy"
+    else
+        echo "zombie"
+    fi
+}
+
+health() {
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No claude sessions running"
+        return 0
+    fi
+
+    printf "%-30s %-10s %-10s %s\n" "SESSION" "STATUS" "AGE" "PANE_PID"
+    printf "%-30s %-10s %-10s %s\n" "-------" "------" "---" "--------"
+
+    echo "$sessions" | while IFS='|' read -r name created; do
+        local status
+        status=$(get_session_health "$name")
+
+        local now
+        now=$(date +%s)
+        local age=$((now - created))
+        local age_fmt="${age}s"
+        if [[ $age -ge 3600 ]]; then
+            age_fmt="$((age / 3600))h$((age % 3600 / 60))m"
+        elif [[ $age -ge 60 ]]; then
+            age_fmt="$((age / 60))m$((age % 60))s"
+        fi
+
+        local pane_pid
+        pane_pid=$(tmux list-panes -t "$name" -F "#{pane_pid}" 2>/dev/null | head -1 || echo "?")
+
+        local status_display="$status"
+        if [[ "$status" == "zombie" ]]; then
+            status_display="ZOMBIE"
+        fi
+
+        printf "%-30s %-10s %-10s %s\n" "$name" "$status_display" "$age_fmt" "$pane_pid"
+    done
+}
+
+zombies() {
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ -z "$sessions" ]]; then
+        return 0
+    fi
+
+    while read -r session; do
+        local status
+        status=$(get_session_health "$session")
+        if [[ "$status" == "zombie" ]]; then
+            echo "$session"
+        fi
+    done <<< "$sessions"
+}
+
+reap() {
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No claude sessions running"
+        return 0
+    fi
+
+    local reaped=0
+    while read -r session; do
+        local status
+        status=$(get_session_health "$session")
+        if [[ "$status" == "zombie" ]]; then
+            tmux kill-session -t "$session"
+            echo "Reaped zombie: $session"
+            ((reaped++)) || true
+        fi
+    done <<< "$sessions"
+
+    if [[ $reaped -eq 0 ]]; then
+        echo "No zombies to reap"
+    else
+        echo "Reaped $reaped zombie session(s)"
+    fi
+}
+
+send_message() {
+    local session="$1"
+    shift
+    local message="$*"
+
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        echo "Session $session does not exist" >&2
+        return 1
+    fi
+
+    tmux send-keys -t "$session" -l "$message"
+    sleep 0.3
+    tmux send-keys -t "$session" Enter
+
+    echo "Sent to $session"
+}
+
+kill_session() {
+    local session="$1"
+
+    if tmux has-session -t "$session" 2>/dev/null; then
+        tmux kill-session -t "$session"
+        echo "Killed $session"
+    else
+        echo "Session $session does not exist" >&2
+        return 1
+    fi
+}
+
+kill_all() {
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No claude sessions to kill"
+        return 0
+    fi
+
+    echo "$sessions" | while read -r session; do
+        tmux kill-session -t "$session"
+        echo "Killed $session"
+    done
+}
+
+attach() {
+    local session="$1"
+
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        echo "Session $session does not exist" >&2
+        return 1
+    fi
+
+    tmux attach -t "$session"
+}
+
+status() {
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}|#{session_created}|#{session_attached}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No claude sessions running"
+        return 0
+    fi
+
+    printf "%-30s %-20s %s\n" "SESSION" "CREATED" "ATTACHED"
+    printf "%-30s %-20s %s\n" "-------" "-------" "--------"
+
+    echo "$sessions" | while IFS='|' read -r name created attached; do
+        created_fmt=$(date -r "$created" "+%H:%M:%S" 2>/dev/null || echo "$created")
+        attached_fmt=$([[ "$attached" == "1" ]] && echo "yes" || echo "no")
+        printf "%-30s %-20s %s\n" "$name" "$created_fmt" "$attached_fmt"
+    done
+}
+
+broadcast() {
+    local message="$*"
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No claude sessions to broadcast to"
+        return 0
+    fi
+
+    echo "$sessions" | while read -r session; do
+        tmux send-keys -t "$session" -l "$message"
+        sleep 0.3
+        tmux send-keys -t "$session" Enter
+        echo "Sent to $session"
+    done
+}
+
+broadcast_workers() {
+    local message="$*"
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-worker" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No workers to broadcast to"
+        return 0
+    fi
+
+    echo "$sessions" | while read -r session; do
+        tmux send-keys -t "$session" -l "$message"
+        sleep 0.3
+        tmux send-keys -t "$session" Enter
+        echo "Sent to $session"
+    done
+}
+
+peek() {
+    local session="$1"
+    local lines="${2:-30}"
+
+    if ! tmux has-session -t "$session" 2>/dev/null; then
+        echo "Session $session does not exist" >&2
+        return 1
+    fi
+
+    tmux capture-pane -t "$session" -p -S "-$lines"
+}
+
+waiting() {
+    local sessions
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No claude sessions running"
+        return 0
+    fi
+
+    echo "$sessions" | while read -r session; do
+        local content
+        content=$(tmux capture-pane -t "$session" -p -S -20 2>/dev/null || true)
+
+        local state="working"
+
+        if echo "$content" | grep -qE "(Allow|Deny|Yes|No).*\?"; then
+            state="PERMISSION PROMPT"
+        elif echo "$content" | grep -qE "^>[[:space:]]*$"; then
+            state="awaiting input"
+        elif echo "$content" | grep -qE "\? \(y/n\)|\[Y/n\]|\[y/N\]"; then
+            state="CONFIRMATION"
+        fi
+
+        if [[ "$state" != "working" ]]; then
+            printf "%-30s %s\n" "$session" "$state"
+        fi
+    done
+}
+
+usage() {
+    cat <<EOF
+mob - Orchestrate multiple Claude Code sessions
+
+USAGE:
+    mob <command> [args]
+
+COMMANDS:
+    spawn <role> [id]       Create session and auto-prime based on role
+                            Roles: coord, worker (auto-primed)
+                            Other roles spawn without priming
+                            Examples: spawn coord, spawn worker 1
+
+    spawn-quiet <role> [id] Create session WITHOUT auto-priming
+
+    list                    List all claude-* sessions
+    workers                 List worker sessions only
+    coord                   Print coordinator session name
+    status                  Show detailed session status
+
+    send <session> <msg>    Send message to a session
+    broadcast <msg>         Send message to ALL sessions
+    broadcast-workers <msg> Send message to all workers only
+
+    peek <session> [lines]  Show last N lines from session (default: 30)
+    waiting                 Show sessions waiting for input/permission
+
+    attach <session>        Attach to a session (detach: Ctrl-b d)
+
+    kill <session>          Kill a specific session
+    killall                 Kill all claude-* sessions
+
+HEALTH MONITORING:
+    health                  Show health status of all sessions (healthy/zombie/starting)
+    zombies                 List zombie sessions (Claude died but tmux persists)
+    reap                    Kill all zombie sessions
+
+WORKER CALLBACKS (run from within a worker session):
+    report <msg>            Send status report to coordinator
+    done <summary>          Signal task completion to coordinator
+    ask <question>          Ask coordinator a question
+
+EXAMPLES:
+    # === QUICK START ===
+    mob spawn coord                    # Spawns + primes coordinator
+    mob spawn worker 1                 # Spawns + primes worker
+    mob spawn worker 2
+
+    # === COORDINATOR DISPATCHES ===
+    mob send claude-worker-1 "Build /users endpoint"
+    mob send claude-worker-2 "Build /posts endpoint"
+
+    # === WORKERS REPORT (from worker session) ===
+    mob done "Completed /users with full CRUD"
+    mob ask "Should I add caching?"
+
+    # === MONITOR ===
+    mob status
+    mob attach claude-coord-*
+
+    # === CLEANUP ===
+    mob killall
+
+EOF
+}
+
+main() {
+    if [[ $# -lt 1 ]]; then
+        usage
+        exit 1
+    fi
+
+    local cmd="$1"
+    shift
+
+    case "$cmd" in
+        spawn)
+            [[ $# -lt 1 ]] && { echo "Usage: spawn <role> [id]" >&2; exit 1; }
+            spawn "$@"
+            ;;
+        spawn-quiet)
+            [[ $# -lt 1 ]] && { echo "Usage: spawn-quiet <role> [id]" >&2; exit 1; }
+            spawn_quiet "$@"
+            ;;
+        list)
+            list_sessions
+            ;;
+        workers)
+            workers
+            ;;
+        coord)
+            coord
+            ;;
+        status)
+            status
+            ;;
+        send)
+            [[ $# -lt 2 ]] && { echo "Usage: send <session> <message>" >&2; exit 1; }
+            send_message "$@"
+            ;;
+        broadcast)
+            [[ $# -lt 1 ]] && { echo "Usage: broadcast <message>" >&2; exit 1; }
+            broadcast "$@"
+            ;;
+        broadcast-workers)
+            [[ $# -lt 1 ]] && { echo "Usage: broadcast-workers <message>" >&2; exit 1; }
+            broadcast_workers "$@"
+            ;;
+        peek)
+            [[ $# -lt 1 ]] && { echo "Usage: peek <session> [lines]" >&2; exit 1; }
+            peek "$@"
+            ;;
+        waiting)
+            waiting
+            ;;
+        attach)
+            [[ $# -lt 1 ]] && { echo "Usage: attach <session>" >&2; exit 1; }
+            attach "$1"
+            ;;
+        kill)
+            [[ $# -lt 1 ]] && { echo "Usage: kill <session>" >&2; exit 1; }
+            kill_session "$1"
+            ;;
+        killall)
+            kill_all
+            ;;
+        health)
+            health
+            ;;
+        zombies)
+            zombies
+            ;;
+        reap)
+            reap
+            ;;
+        report)
+            [[ $# -lt 1 ]] && { echo "Usage: report <message>" >&2; exit 1; }
+            report "$@"
+            ;;
+        done)
+            [[ $# -lt 1 ]] && { echo "Usage: done <summary>" >&2; exit 1; }
+            done_task "$@"
+            ;;
+        ask)
+            [[ $# -lt 1 ]] && { echo "Usage: ask <question>" >&2; exit 1; }
+            ask_coord "$@"
+            ;;
+        crash)
+            [[ $# -lt 1 ]] && { echo "Usage: crash <session>" >&2; exit 1; }
+            crash_handler "$1"
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            echo "Unknown command: $cmd" >&2
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
