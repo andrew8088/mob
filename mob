@@ -4,6 +4,9 @@ set -euo pipefail
 SESSION_PREFIX="claude"
 PRIME_DELAY=3  # seconds to wait for Claude to start
 ZOMBIE_GRACE_PERIOD=10  # seconds after session creation before marking as zombie
+HEARTBEAT_FRESH=300   # 5 minutes - heartbeat considered fresh
+HEARTBEAT_STALE=900   # 15 minutes - heartbeat considered stale
+HEARTBEAT_DIR="/tmp/mob-heartbeats"
 
 WORKER_TOOLS="Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch,Task,TodoWrite"
 
@@ -178,6 +181,52 @@ ask_coord() {
     echo "Question sent to $coord_session"
 }
 
+heartbeat() {
+    mkdir -p "$HEARTBEAT_DIR"
+    local sender
+    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    if [[ "$sender" == "unknown" ]]; then
+        echo "Cannot determine session name" >&2
+        return 1
+    fi
+
+    echo "$(date +%s)" > "$HEARTBEAT_DIR/$sender"
+    echo "Heartbeat recorded for $sender"
+}
+
+get_heartbeat_age() {
+    local session="$1"
+    local heartbeat_file="$HEARTBEAT_DIR/$session"
+
+    if [[ ! -f "$heartbeat_file" ]]; then
+        echo "-1"
+        return
+    fi
+
+    local last_beat
+    last_beat=$(cat "$heartbeat_file" 2>/dev/null || echo "0")
+    local now
+    now=$(date +%s)
+    echo $((now - last_beat))
+}
+
+get_heartbeat_status() {
+    local session="$1"
+    local age
+    age=$(get_heartbeat_age "$session")
+
+    if [[ $age -eq -1 ]]; then
+        echo "none"
+    elif [[ $age -lt $HEARTBEAT_FRESH ]]; then
+        echo "fresh"
+    elif [[ $age -lt $HEARTBEAT_STALE ]]; then
+        echo "aging"
+    else
+        echo "stale"
+    fi
+}
+
 crash_handler() {
     local crashed_session="$1"
     local coord_session
@@ -248,11 +297,19 @@ get_session_health() {
         return 0
     fi
 
-    if is_claude_running_in_session "$session"; then
-        echo "healthy"
-    else
+    if ! is_claude_running_in_session "$session"; then
         echo "zombie"
+        return 0
     fi
+
+    local hb_status
+    hb_status=$(get_heartbeat_status "$session")
+    if [[ "$hb_status" == "stale" ]]; then
+        echo "stuck"
+        return 0
+    fi
+
+    echo "healthy"
 }
 
 health() {
@@ -264,8 +321,8 @@ health() {
         return 0
     fi
 
-    printf "%-30s %-10s %-10s %s\n" "SESSION" "STATUS" "AGE" "PANE_PID"
-    printf "%-30s %-10s %-10s %s\n" "-------" "------" "---" "--------"
+    printf "%-30s %-10s %-10s %-12s %s\n" "SESSION" "STATUS" "AGE" "HEARTBEAT" "PANE_PID"
+    printf "%-30s %-10s %-10s %-12s %s\n" "-------" "------" "---" "---------" "--------"
 
     echo "$sessions" | while IFS='|' read -r name created; do
         local status
@@ -287,9 +344,27 @@ health() {
         local status_display="$status"
         if [[ "$status" == "zombie" ]]; then
             status_display="ZOMBIE"
+        elif [[ "$status" == "stuck" ]]; then
+            status_display="STUCK"
         fi
 
-        printf "%-30s %-10s %-10s %s\n" "$name" "$status_display" "$age_fmt" "$pane_pid"
+        local hb_age
+        hb_age=$(get_heartbeat_age "$name")
+        local hb_display="none"
+        if [[ $hb_age -ge 0 ]]; then
+            local hb_status
+            hb_status=$(get_heartbeat_status "$name")
+            if [[ $hb_age -ge 3600 ]]; then
+                hb_display="$((hb_age / 3600))h$((hb_age % 3600 / 60))m"
+            elif [[ $hb_age -ge 60 ]]; then
+                hb_display="$((hb_age / 60))m$((hb_age % 60))s"
+            else
+                hb_display="${hb_age}s"
+            fi
+            hb_display="$hb_display($hb_status)"
+        fi
+
+        printf "%-30s %-10s %-10s %-12s %s\n" "$name" "$status_display" "$age_fmt" "$hb_display" "$pane_pid"
     done
 }
 
@@ -521,7 +596,9 @@ COMMANDS:
     killall                 Kill all claude-* sessions
 
 HEALTH MONITORING:
-    health                  Show health status of all sessions (healthy/zombie/starting)
+    health                  Show health status with heartbeat freshness
+                            Status: healthy, starting, ZOMBIE, STUCK
+                            Heartbeat: fresh (<5m), aging (5-15m), stale (>15m)
     zombies                 List zombie sessions (Claude died but tmux persists)
     reap                    Kill all zombie sessions
 
@@ -529,6 +606,7 @@ WORKER CALLBACKS (run from within a worker session):
     report <msg>            Send status report to coordinator
     done <summary>          Signal task completion to coordinator
     ask <question>          Ask coordinator a question
+    heartbeat               Record heartbeat (proves worker is alive)
 
 EXAMPLES:
     # === QUICK START ===
@@ -634,6 +712,9 @@ main() {
         ask)
             [[ $# -lt 1 ]] && { echo "Usage: ask <question>" >&2; exit 1; }
             ask_coord "$@"
+            ;;
+        heartbeat)
+            heartbeat
             ;;
         crash)
             [[ $# -lt 1 ]] && { echo "Usage: crash <session>" >&2; exit 1; }
