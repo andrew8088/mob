@@ -187,14 +187,20 @@ report() {
 
 done_task() {
     local task_summary="$*"
+
+    local sender
+    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    if [[ "$sender" != "${SESSION_PREFIX}-worker"* ]]; then
+        echo "Only workers can call 'mob done' (you are: $sender)" >&2
+        return 1
+    fi
+
     local coord_session
     coord_session=$(coord 2>/dev/null) || {
         echo "No coordinator to report to" >&2
         return 1
     }
-
-    local sender
-    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
 
     tmux send-keys -t "$coord_session" -l "[DONE from $sender] $task_summary"
     sleep 0.3
@@ -202,10 +208,8 @@ done_task() {
 
     echo "Completion reported to $coord_session"
 
-    if [[ "$sender" == "${SESSION_PREFIX}-worker"* ]]; then
-        sleep 1
-        tmux kill-session -t "$sender" 2>/dev/null &
-    fi
+    sleep 1
+    tmux kill-session -t "$sender" 2>/dev/null &
 }
 
 ask_coord() {
