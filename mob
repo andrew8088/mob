@@ -7,6 +7,7 @@ ZOMBIE_GRACE_PERIOD=10  # seconds after session creation before marking as zombi
 HEARTBEAT_FRESH=300   # 5 minutes - heartbeat considered fresh
 HEARTBEAT_STALE=900   # 15 minutes - heartbeat considered stale
 HEARTBEAT_DIR="/tmp/mob-heartbeats"
+LOCK_DIR="/tmp/mob-locks"
 
 WORKER_TOOLS="Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch,Task,TodoWrite"
 
@@ -32,6 +33,47 @@ Progress update: `mob report "status"`
 
 Focus only on your assigned task. Don't wait for confirmation after `mob done`.
 EOF
+
+_acquire_lock() {
+    local session="$1"
+    local lockdir="$LOCK_DIR/${session}.lock"
+    local max_attempts=30
+    local attempt=0
+
+    mkdir -p "$LOCK_DIR"
+
+    while ! mkdir "$lockdir" 2>/dev/null; do
+        ((attempt++))
+        if [[ $attempt -ge $max_attempts ]]; then
+            echo "Failed to acquire lock for $session after ${max_attempts}s" >&2
+            return 1
+        fi
+        sleep 1
+    done
+
+    trap "_release_lock '$session'" EXIT
+    return 0
+}
+
+_release_lock() {
+    local session="$1"
+    local lockdir="$LOCK_DIR/${session}.lock"
+    rmdir "$lockdir" 2>/dev/null || true
+}
+
+_send_keys_locked() {
+    local session="$1"
+    shift
+    local message="$*"
+
+    (
+        _acquire_lock "$session" || exit 1
+        tmux send-keys -t "$session" -l "$message"
+        sleep 0.3
+        tmux send-keys -t "$session" Enter
+        _release_lock "$session"
+    )
+}
 
 setup_crash_detection() {
     local session="$1"
@@ -422,10 +464,7 @@ send_message() {
         return 1
     fi
 
-    tmux send-keys -t "$session" -l "$message"
-    sleep 0.3
-    tmux send-keys -t "$session" Enter
-
+    _send_keys_locked "$session" "$message"
     echo "Sent to $session"
 }
 
@@ -497,9 +536,7 @@ broadcast() {
     fi
 
     echo "$sessions" | while read -r session; do
-        tmux send-keys -t "$session" -l "$message"
-        sleep 0.3
-        tmux send-keys -t "$session" Enter
+        _send_keys_locked "$session" "$message"
         echo "Sent to $session"
     done
 }
@@ -515,9 +552,7 @@ broadcast_workers() {
     fi
 
     echo "$sessions" | while read -r session; do
-        tmux send-keys -t "$session" -l "$message"
-        sleep 0.3
-        tmux send-keys -t "$session" Enter
+        _send_keys_locked "$session" "$message"
         echo "Sent to $session"
     done
 }
