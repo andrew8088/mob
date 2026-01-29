@@ -10,7 +10,7 @@ HEARTBEAT_DIR="/tmp/mob-heartbeats"
 LOCK_DIR="/tmp/mob-locks"
 LOG_DIR="/tmp/mob-logs"
 
-WORKER_TOOLS="Read,Write,Edit,Glob,Grep,Bash,WebSearch,WebFetch,Task,TodoWrite"
+WORKER_TOOLS='Read,Write,Edit,Glob,Grep,Bash(git:*,npm:*,npx:*,pnpm:*,yarn:*,make:*,jest:*,vitest:*,pytest:*,cargo:*),WebSearch,WebFetch,Task,TodoWrite'
 
 read -r -d '' COORD_PROMPT << 'EOF' || true
 You are a **coordinator** managing Claude Code workers via `mob`. Your job:
@@ -97,7 +97,7 @@ spawn() {
     sleep 0.2
 
     if [[ "$role" == "worker"* ]]; then
-        tmux send-keys -t "$name" "claude --allowedTools '$WORKER_TOOLS'" Enter
+        tmux send-keys -t "$name" "claude --model sonnet --dangerously-skip-permissions --setting-sources '' --allowedTools '$WORKER_TOOLS'" Enter
         setup_crash_detection "$name"
     else
         tmux send-keys -t "$name" "claude" Enter
