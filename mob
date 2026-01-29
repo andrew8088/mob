@@ -15,15 +15,17 @@ WORKER_TOOLS='Read,Write,Edit,Glob,Grep,Bash(mob:*,git:*,npm:*,npx:*,pnpm:*,yarn
 REVIEWER_TOOLS='Read,Glob,Grep,Bash(mob:*,git:*,npm:test,npm:lint,npx:*,pnpm:test,pnpm:lint,yarn:test,yarn:lint,make:test,make:lint,jest:*,vitest:*,pytest:*,cargo:test,cargo:clippy),WebSearch,WebFetch,Task,TodoWrite'
 RESEARCHER_TOOLS='Read,Glob,Grep,Bash(mob:*),WebSearch,WebFetch,Task,TodoWrite'
 PLANNER_TOOLS='Read,Glob,Grep,Bash(mob:*),WebSearch,WebFetch,Task,TodoWrite'
+OPERATOR_TOOLS='Read,Glob,Grep,Bash(mob:*),WebSearch,WebFetch,Task,TodoWrite'
 
 read -r -d '' COORD_PROMPT << 'EOF' || true
-You are a **coordinator** managing Claude Code workers via `mob`. Your job:
-1. Break tasks into subtasks
-2. Choose the right worker type for each subtask
-3. Dispatch work: `mob dispatch <type> <id> "<task>. When done: mob done '<summary>'"`
-4. Check inbox periodically: `mob inbox` (workers queue completions here)
-5. Handle interrupts: [QUESTION from ...] and [CRASH from ...] appear immediately
-6. Synthesize results when all workers complete
+You are a **coordinator** running in the background, managed by an Operator. Your job:
+1. Check priority inbox FIRST: `mob priority` (messages from Operator)
+2. Then check worker inbox: `mob inbox` (completions from workers)
+3. Break tasks into subtasks and dispatch workers
+4. Handle worker questions/crashes autonomously when possible
+5. Report significant results back: `mob report "summary for operator"`
+
+**PRIORITY INBOX**: Always check `mob priority` before `mob inbox`. Operator messages take precedence.
 
 **CRITICAL: Use `mob dispatch`, NOT the Task tool!**
 - `mob dispatch` spawns real tmux workers with full write permissions
@@ -44,9 +46,9 @@ Patterns:
 - PR review → reviewer
 - Write tests → worker (NOT Task tool)
 
-Commands: `mob dispatch <type> <id> <task>`, `mob inbox`, `mob workers`, `mob kill <session>`
+Commands: `mob dispatch <type> <id> <task>`, `mob priority`, `mob inbox`, `mob workers`, `mob kill <session>`, `mob report <msg>`
 
-Keep tasks independent where possible. Always tell workers to run `mob done` when finished.
+Work autonomously. Handle worker questions yourself unless truly blocked. Report progress to the Operator.
 EOF
 
 read -r -d '' WORKER_PROMPT << 'EOF' || true
@@ -93,6 +95,34 @@ If stuck: `mob ask "your question"`
 Progress update: `mob report "status"`
 
 Focus only on your assigned planning task. Don't wait for confirmation after `mob done`.
+EOF
+
+read -r -d '' OPERATOR_PROMPT << 'EOF' || true
+You are the **operator** - the user's interface to the mob swarm. You shield them from worker noise.
+
+Your job:
+1. Accept tasks from the user and translate them into coordinator instructions
+2. Send tasks to coordinator: `mob task "detailed instructions"`
+3. Check coordinator reports: `mob results`
+4. Monitor swarm health: `mob health`, `mob workers`
+5. Summarize and present results to the user
+
+**You do NOT talk directly to workers.** The coordinator handles all worker management.
+
+Flow:
+1. User gives you a task
+2. You clarify if needed, then `mob task "..."` to coordinator
+3. Periodically check `mob results` for coordinator reports
+4. When work completes, synthesize and present to user
+
+Commands:
+- `mob task "instructions"` - Send priority task to coordinator
+- `mob results` - Read coordinator's reports to you
+- `mob health` - Check swarm status
+- `mob workers` - List active workers
+- `mob peek claude-coord-*` - See coordinator's recent activity
+
+You are the calm interface. Let the coordinator handle the chaos.
 EOF
 
 _acquire_lock() {
@@ -168,6 +198,8 @@ spawn() {
     elif [[ "$role" == "planner"* ]]; then
         tmux send-keys -t "$name" "claude --model opus --dangerously-skip-permissions --setting-sources '' --allowedTools '$PLANNER_TOOLS'" Enter
         setup_crash_detection "$name"
+    elif [[ "$role" == "operator"* ]]; then
+        tmux send-keys -t "$name" "claude --model opus --dangerously-skip-permissions --setting-sources '' --allowedTools '$OPERATOR_TOOLS'" Enter
     else
         tmux send-keys -t "$name" "claude" Enter
     fi
@@ -208,6 +240,13 @@ spawn() {
         sleep 0.3
         tmux send-keys -t "$name" Enter
         echo "$name (primed as planner with opus, crash detection enabled)"
+    elif [[ "$role" == "operator"* ]]; then
+        echo "Waiting ${PRIME_DELAY}s for Claude to start..."
+        sleep "$PRIME_DELAY"
+        tmux send-keys -t "$name" -l "$OPERATOR_PROMPT"
+        sleep 0.3
+        tmux send-keys -t "$name" Enter
+        echo "$name (primed as operator with opus)"
     else
         echo "$name (no auto-prime for role: $role)"
     fi
@@ -269,21 +308,47 @@ coord() {
     echo "$coord_session"
 }
 
+operator() {
+    local operator_session
+    operator_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
+        | grep "^${SESSION_PREFIX}-operator" \
+        | head -1 || true)
+
+    if [[ -z "$operator_session" ]]; then
+        echo "No operator found" >&2
+        return 1
+    fi
+
+    echo "$operator_session"
+}
+
 report() {
     local message="$*"
-    local coord_session
-    coord_session=$(coord 2>/dev/null) || {
-        echo "No coordinator to report to" >&2
-        return 1
-    }
-
     local sender
     sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
 
     mkdir -p "$INBOX_DIR"
-    echo "{\"type\":\"REPORT\",\"from\":\"$sender\",\"message\":\"$message\",\"ts\":$(date +%s)}" >> "$INBOX_DIR/$coord_session.jsonl"
 
-    echo "Report queued for $coord_session (check with: mob inbox)"
+    if [[ "$sender" == "${SESSION_PREFIX}-coord"* ]]; then
+        local operator_session
+        operator_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
+            | grep "^${SESSION_PREFIX}-operator" \
+            | head -1 || true)
+        if [[ -z "$operator_session" ]]; then
+            echo "No operator to report to" >&2
+            return 1
+        fi
+        echo "{\"type\":\"REPORT\",\"from\":\"$sender\",\"message\":\"$message\",\"ts\":$(date +%s)}" >> "$INBOX_DIR/${operator_session}-results.jsonl"
+        echo "Report queued for $operator_session (check with: mob results)"
+    else
+        local coord_session
+        coord_session=$(coord 2>/dev/null) || {
+            echo "No coordinator to report to" >&2
+            return 1
+        }
+        echo "{\"type\":\"REPORT\",\"from\":\"$sender\",\"message\":\"$message\",\"ts\":$(date +%s)}" >> "$INBOX_DIR/$coord_session.jsonl"
+        echo "Report queued for $coord_session (check with: mob inbox)"
+    fi
 }
 
 done_task() {
@@ -388,6 +453,98 @@ inbox_count() {
     fi
 
     wc -l < "$inbox_file" | tr -d ' '
+}
+
+task() {
+    local message="$*"
+    local coord_session
+    coord_session=$(coord 2>/dev/null) || {
+        echo "No coordinator found" >&2
+        return 1
+    }
+
+    local sender
+    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    mkdir -p "$INBOX_DIR"
+    local priority_file="$INBOX_DIR/${coord_session}-priority.jsonl"
+    echo "{\"type\":\"TASK\",\"from\":\"$sender\",\"message\":\"$message\",\"ts\":$(date +%s)}" >> "$priority_file"
+
+    _send_keys_locked "$coord_session" "[PRIORITY] New task from operator. Run: mob priority"
+
+    echo "Priority task sent to $coord_session"
+}
+
+priority() {
+    local coord_session
+    coord_session=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    if [[ "$coord_session" != "${SESSION_PREFIX}-coord"* ]]; then
+        echo "Only coordinators can check priority inbox" >&2
+        return 1
+    fi
+
+    local priority_file="$INBOX_DIR/${coord_session}-priority.jsonl"
+
+    if [[ ! -f "$priority_file" ]] || [[ ! -s "$priority_file" ]]; then
+        echo "No priority messages"
+        return 0
+    fi
+
+    local count
+    count=$(wc -l < "$priority_file" | tr -d ' ')
+    echo "=== PRIORITY INBOX ($count messages) ==="
+    echo ""
+
+    while IFS= read -r line; do
+        local msg_type msg_from msg_text
+        msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+        msg_from=$(echo "$line" | sed -n 's/.*"from":"\([^"]*\)".*/\1/p')
+        msg_text=$(echo "$line" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+        echo "[$msg_type from $msg_from] $msg_text"
+    done < "$priority_file"
+
+    rm -f "$priority_file"
+    echo ""
+    echo "--- Priority inbox cleared ---"
+}
+
+results() {
+    local operator_session
+    operator_session=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    if [[ "$operator_session" != "${SESSION_PREFIX}-operator"* ]]; then
+        operator_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
+            | grep "^${SESSION_PREFIX}-operator" \
+            | head -1 || true)
+        if [[ -z "$operator_session" ]]; then
+            echo "No operator found" >&2
+            return 1
+        fi
+    fi
+
+    local results_file="$INBOX_DIR/${operator_session}-results.jsonl"
+
+    if [[ ! -f "$results_file" ]] || [[ ! -s "$results_file" ]]; then
+        echo "No results from coordinator"
+        return 0
+    fi
+
+    local count
+    count=$(wc -l < "$results_file" | tr -d ' ')
+    echo "=== COORDINATOR REPORTS ($count messages) ==="
+    echo ""
+
+    while IFS= read -r line; do
+        local msg_from msg_text
+        msg_from=$(echo "$line" | sed -n 's/.*"from":"\([^"]*\)".*/\1/p')
+        msg_text=$(echo "$line" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+        echo "[from $msg_from] $msg_text"
+    done < "$results_file"
+
+    rm -f "$results_file"
+    echo ""
+    echo "--- Results cleared ---"
 }
 
 heartbeat() {
@@ -675,27 +832,49 @@ attach() {
 
 start() {
     local id="${1:-$(date +%s)}"
-    local name="${SESSION_PREFIX}-coord-${id}"
+    local coord_name="${SESSION_PREFIX}-coord-${id}"
+    local operator_name="${SESSION_PREFIX}-operator-${id}"
 
-    if tmux has-session -t "$name" 2>/dev/null; then
-        echo "Session $name already exists" >&2
+    if tmux has-session -t "$coord_name" 2>/dev/null; then
+        echo "Session $coord_name already exists" >&2
+        return 1
+    fi
+    if tmux has-session -t "$operator_name" 2>/dev/null; then
+        echo "Session $operator_name already exists" >&2
         return 1
     fi
 
     mkdir -p "$LOG_DIR"
-    tmux new-session -d -s "$name"
+
+    echo "Starting coordinator in background..."
+    tmux new-session -d -s "$coord_name"
     sleep 0.2
-    tmux pipe-pane -t "$name" -o "cat >> '$LOG_DIR/$name.log'"
-    tmux send-keys -t "$name" "claude" Enter
-
-    echo "Waiting ${PRIME_DELAY}s for Claude to start..."
+    tmux pipe-pane -t "$coord_name" -o "cat >> '$LOG_DIR/$coord_name.log'"
+    tmux send-keys -t "$coord_name" "claude --model sonnet --dangerously-skip-permissions --setting-sources '' --allowedTools '$WORKER_TOOLS'" Enter
+    setup_crash_detection "$coord_name"
     sleep "$PRIME_DELAY"
-    tmux send-keys -t "$name" -l "$COORD_PROMPT"
+    tmux send-keys -t "$coord_name" -l "$COORD_PROMPT"
     sleep 0.3
-    tmux send-keys -t "$name" Enter
-    echo "$name (primed as coordinator)"
+    tmux send-keys -t "$coord_name" Enter
+    echo "$coord_name (background coordinator ready)"
 
-    tmux attach -t "$name"
+    echo "Starting operator..."
+    tmux new-session -d -s "$operator_name"
+    sleep 0.2
+    tmux pipe-pane -t "$operator_name" -o "cat >> '$LOG_DIR/$operator_name.log'"
+    tmux send-keys -t "$operator_name" "claude --model opus --dangerously-skip-permissions --setting-sources '' --allowedTools '$OPERATOR_TOOLS'" Enter
+    sleep "$PRIME_DELAY"
+    tmux send-keys -t "$operator_name" -l "$OPERATOR_PROMPT"
+    sleep 0.3
+    tmux send-keys -t "$operator_name" Enter
+    echo "$operator_name (operator ready)"
+
+    echo ""
+    echo "Attaching to operator. Coordinator runs in background."
+    echo "Use 'mob task \"...\"' to send work to coordinator."
+    echo "Use 'mob results' to check coordinator reports."
+    echo ""
+    tmux attach -t "$operator_name"
 }
 
 status() {
@@ -778,6 +957,39 @@ logs() {
     fi
 }
 
+listen() {
+    mkdir -p "$INBOX_DIR"
+
+    echo "Listening for mob messages... (Ctrl+C to stop)"
+    echo "---"
+
+    touch "$INBOX_DIR/.listen-probe"
+
+    tail -F "$INBOX_DIR"/*.jsonl 2>/dev/null | while read -r line; do
+        [[ -z "$line" ]] && continue
+        [[ "$line" == *"==>"* ]] && continue
+
+        local msg_type msg_from msg_text ts time
+        msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+        msg_from=$(echo "$line" | sed -n 's/.*"from":"\([^"]*\)".*/\1/p')
+        msg_text=$(echo "$line" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+        ts=$(echo "$line" | sed -n 's/.*"ts":\([0-9]*\).*/\1/p')
+
+        [[ -z "$msg_type" ]] && continue
+
+        time=$(date -r "$ts" "+%H:%M:%S" 2>/dev/null || echo "??:??:??")
+
+        case "$msg_type" in
+            DONE)   printf "\033[32m" ;;
+            REPORT) printf "\033[33m" ;;
+            TASK)   printf "\033[36m" ;;
+            *)      printf "\033[37m" ;;
+        esac
+
+        printf "[%s] %s → %s: %s\033[0m\n" "$time" "$msg_from" "$msg_type" "$msg_text"
+    done
+}
+
 waiting() {
     local sessions
     sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
@@ -829,31 +1041,39 @@ usage() {
     cat <<EOF
 mob - Orchestrate multiple Claude Code sessions
 
+ARCHITECTURE:
+    User ↔ Operator ↔ Coordinator (background) ↔ Workers
+
+    - Operator: Your interface (opus). Shields you from worker noise.
+    - Coordinator: Background orchestrator. Manages all workers.
+    - Workers: Do the actual work (write code, research, etc.)
+
 USAGE:
     mob <command> [args]
 
 COMMANDS:
-    start [id]              Start coordinator and attach to it
+    start [id]              Start operator + coordinator, attach to operator
                             This is the quickest way to begin
 
     spawn <role> [id]       Create session and auto-prime based on role
-                            Roles: coord, worker, researcher, reviewer, planner
+                            Roles: operator, coord, worker, researcher, reviewer, planner
+                            - operator: user interface (opus)
+                            - coord: background orchestrator (sonnet)
                             - worker: full tools (read/write/bash)
                             - researcher: read-only (explore code, no edits)
                             - reviewer: read + test/lint commands
                             - planner: read-only with opus model
-                            Examples: spawn worker 1, spawn researcher 2
 
     spawn-quiet <role> [id] Create session WITHOUT auto-priming
 
     dispatch <role> <id> <task>
                             Spawn worker AND send task in one command
-                            This is the preferred way to assign work
                             Example: dispatch worker 1 "Build the auth module"
 
     list                    List all claude-* sessions
     workers                 List worker sessions only
     coord                   Print coordinator session name
+    operator                Print operator session name
     status                  Show detailed session status
 
     send <session> <msg>    Send message to a session
@@ -864,6 +1084,7 @@ COMMANDS:
     logs <session> [lines]  Show session log file (optional: last N lines)
     waiting                 Show sessions waiting for input/permission
     watch                   Live dashboard with auto-refresh (Ctrl+C to exit)
+    listen                  Stream all inbox messages in real-time
 
     attach <session>        Attach to a session (detach: Ctrl-b d)
 
@@ -872,17 +1093,17 @@ COMMANDS:
 
 HEALTH MONITORING:
     health                  Show health status with heartbeat freshness
-                            Status: healthy, starting, ZOMBIE, STUCK
-                            Heartbeat: fresh (<5m), aging (5-15m), stale (>15m)
     zombies                 List zombie sessions (Claude died but tmux persists)
     reap                    Kill all zombie sessions
 
-INBOX (non-interruptive message queue):
-    inbox                   Read and clear pending messages from workers
-    inbox-count             Show count of pending messages (for scripts)
+OPERATOR COMMANDS (run from operator session):
+    task <msg>              Send priority task to coordinator
+    results                 Read coordinator's reports to you
 
-    Workers use `mob done` and `mob report` to queue messages.
-    Only `mob ask` (questions) and crashes interrupt immediately.
+COORDINATOR COMMANDS (run from coordinator session):
+    priority                Read priority inbox (from operator)
+    inbox                   Read worker inbox (completions, reports)
+    report <msg>            Send report to operator
 
 WORKER CALLBACKS (run from within a worker session):
     report <msg>            Queue status report for coordinator
@@ -892,19 +1113,17 @@ WORKER CALLBACKS (run from within a worker session):
 
 EXAMPLES:
     # === QUICK START ===
-    mob start                          # Start coordinator and attach
+    mob start                          # Spawns operator + coordinator, attaches to operator
 
-    # === DISPATCH WORK (spawn + send in one step) ===
-    mob dispatch worker 1 "Build /users endpoint. When done: mob done 'summary'"
-    mob dispatch worker 2 "Build /posts endpoint. When done: mob done 'summary'"
+    # === FROM OPERATOR: send task to coordinator ===
+    mob task "Build a REST API with /users and /posts endpoints"
 
-    # === WORKERS REPORT (from worker session) ===
-    mob done "Completed /users with full CRUD"
-    mob ask "Should I add caching?"
+    # === FROM OPERATOR: check coordinator's reports ===
+    mob results
 
     # === MONITOR ===
-    mob status
-    mob attach claude-coord-*
+    mob health
+    mob peek claude-coord-*            # See coordinator activity
 
     # === CLEANUP ===
     mob killall
@@ -943,6 +1162,9 @@ main() {
         coord)
             coord
             ;;
+        operator)
+            operator
+            ;;
         status)
             status
             ;;
@@ -971,6 +1193,9 @@ main() {
             ;;
         watch)
             watch
+            ;;
+        listen)
+            listen
             ;;
         attach)
             [[ $# -lt 1 ]] && { echo "Usage: attach <session>" >&2; exit 1; }
@@ -1009,6 +1234,16 @@ main() {
             ;;
         inbox-count)
             inbox_count
+            ;;
+        task)
+            [[ $# -lt 1 ]] && { echo "Usage: task <message>" >&2; exit 1; }
+            task "$@"
+            ;;
+        priority)
+            priority
+            ;;
+        results)
+            results
             ;;
         heartbeat)
             heartbeat
