@@ -20,11 +20,10 @@ read -r -d '' COORD_PROMPT << 'EOF' || true
 You are a **coordinator** managing Claude Code workers via `mob`. Your job:
 1. Break tasks into subtasks
 2. Choose the right worker type for each subtask
-3. Spawn workers: `mob spawn <type> <id>`
-4. Dispatch work: `mob send claude-<type>-<id> "<task>. When done: mob done '<summary>'"`
-5. Check inbox periodically: `mob inbox` (workers queue completions here)
-6. Handle interrupts: [QUESTION from ...] and [CRASH from ...] appear immediately
-7. Synthesize results when all workers complete
+3. Dispatch work: `mob dispatch <type> <id> "<task>. When done: mob done '<summary>'"`
+4. Check inbox periodically: `mob inbox` (workers queue completions here)
+5. Handle interrupts: [QUESTION from ...] and [CRASH from ...] appear immediately
+6. Synthesize results when all workers complete
 
 Worker types (choose based on task):
 - researcher: understand code, find patterns, explore (read-only, safe to spawn liberally)
@@ -39,7 +38,7 @@ Patterns:
 - Refactor → planner → worker(s) → reviewer
 - PR review → reviewer
 
-Commands: `mob spawn <type> <id>`, `mob send <session> <msg>`, `mob inbox`, `mob workers`, `mob kill <session>`
+Commands: `mob dispatch <type> <id> <task>`, `mob inbox`, `mob workers`, `mob kill <session>`
 
 Keep tasks independent where possible. Always tell workers to run `mob done` when finished.
 EOF
@@ -224,6 +223,18 @@ spawn_quiet() {
     tmux pipe-pane -t "$name" -o "cat >> '$LOG_DIR/$name.log'"
     tmux send-keys -t "$name" "claude" Enter
     echo "$name"
+}
+
+dispatch() {
+    local role="$1"
+    local id="$2"
+    local task="$3"
+    local name="${SESSION_PREFIX}-${role}-${id}"
+
+    spawn "$role" "$id" >/dev/null
+    sleep 0.5
+    _send_keys_locked "$name" "$task"
+    echo "Dispatched to $name"
 }
 
 list_sessions() {
@@ -829,6 +840,11 @@ COMMANDS:
 
     spawn-quiet <role> [id] Create session WITHOUT auto-priming
 
+    dispatch <role> <id> <task>
+                            Spawn worker AND send task in one command
+                            This is the preferred way to assign work
+                            Example: dispatch worker 1 "Build the auth module"
+
     list                    List all claude-* sessions
     workers                 List worker sessions only
     coord                   Print coordinator session name
@@ -871,12 +887,10 @@ WORKER CALLBACKS (run from within a worker session):
 EXAMPLES:
     # === QUICK START ===
     mob start                          # Start coordinator and attach
-    mob spawn worker 1                 # Spawns + primes worker
-    mob spawn worker 2
 
-    # === COORDINATOR DISPATCHES ===
-    mob send claude-worker-1 "Build /users endpoint"
-    mob send claude-worker-2 "Build /posts endpoint"
+    # === DISPATCH WORK (spawn + send in one step) ===
+    mob dispatch worker 1 "Build /users endpoint. When done: mob done 'summary'"
+    mob dispatch worker 2 "Build /posts endpoint. When done: mob done 'summary'"
 
     # === WORKERS REPORT (from worker session) ===
     mob done "Completed /users with full CRUD"
@@ -909,6 +923,10 @@ main() {
         spawn-quiet)
             [[ $# -lt 1 ]] && { echo "Usage: spawn-quiet <role> [id]" >&2; exit 1; }
             spawn_quiet "$@"
+            ;;
+        dispatch)
+            [[ $# -lt 3 ]] && { echo "Usage: dispatch <role> <id> <task>" >&2; exit 1; }
+            dispatch "$@"
             ;;
         list)
             list_sessions
