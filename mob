@@ -125,6 +125,17 @@ Commands:
 You are the calm interface. Let the coordinator handle the chaos.
 EOF
 
+_extract_namespace() {
+    local session="$1"
+    local remainder="${session#claude-}"
+    remainder="${remainder#*-}"
+    if [[ "$remainder" == *"_"* ]]; then
+        echo "${remainder%_*}"
+    else
+        echo "$remainder"
+    fi
+}
+
 _acquire_lock() {
     local session="$1"
     local lockdir="$LOCK_DIR/${session}.lock"
@@ -274,9 +285,23 @@ dispatch() {
     local role="$1"
     local id="$2"
     local task="$3"
-    local name="${SESSION_PREFIX}-${role}-${id}"
 
-    spawn "$role" "$id" >/dev/null
+    local sender
+    sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "")
+    local namespace=""
+    if [[ -n "$sender" && "$sender" == claude-* ]]; then
+        namespace=$(_extract_namespace "$sender")
+    fi
+
+    local name
+    if [[ -n "$namespace" ]]; then
+        name="${SESSION_PREFIX}-${role}-${namespace}_${id}"
+        spawn "$role" "${namespace}_${id}" >/dev/null
+    else
+        name="${SESSION_PREFIX}-${role}-${id}"
+        spawn "$role" "$id" >/dev/null
+    fi
+
     sleep 0.5
     _send_keys_locked "$name" "$task"
     echo "Dispatched to $name"
@@ -295,13 +320,25 @@ workers() {
 }
 
 coord() {
+    local namespace="${1:-}"
+
+    if [[ -z "$namespace" ]]; then
+        local sender
+        sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "")
+        if [[ -n "$sender" && "$sender" == claude-* ]]; then
+            namespace=$(_extract_namespace "$sender")
+        fi
+    fi
+
+    local pattern="^${SESSION_PREFIX}-coord-"
+    [[ -n "$namespace" ]] && pattern="${pattern}${namespace}$"
+
     local coord_session
     coord_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
-        | grep "^${SESSION_PREFIX}-coord" \
-        | head -1 || true)
+        | grep "$pattern" | head -1 || true)
 
     if [[ -z "$coord_session" ]]; then
-        echo "No coordinator found" >&2
+        echo "No coordinator found${namespace:+ for namespace: $namespace}" >&2
         return 1
     fi
 
@@ -309,13 +346,25 @@ coord() {
 }
 
 operator() {
+    local namespace="${1:-}"
+
+    if [[ -z "$namespace" ]]; then
+        local sender
+        sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "")
+        if [[ -n "$sender" && "$sender" == claude-* ]]; then
+            namespace=$(_extract_namespace "$sender")
+        fi
+    fi
+
+    local pattern="^${SESSION_PREFIX}-operator-"
+    [[ -n "$namespace" ]] && pattern="${pattern}${namespace}$"
+
     local operator_session
     operator_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
-        | grep "^${SESSION_PREFIX}-operator" \
-        | head -1 || true)
+        | grep "$pattern" | head -1 || true)
 
     if [[ -z "$operator_session" ]]; then
-        echo "No operator found" >&2
+        echo "No operator found${namespace:+ for namespace: $namespace}" >&2
         return 1
     fi
 
@@ -331,13 +380,10 @@ report() {
 
     if [[ "$sender" == "${SESSION_PREFIX}-coord"* ]]; then
         local operator_session
-        operator_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
-            | grep "^${SESSION_PREFIX}-operator" \
-            | head -1 || true)
-        if [[ -z "$operator_session" ]]; then
+        operator_session=$(operator 2>/dev/null) || {
             echo "No operator to report to" >&2
             return 1
-        fi
+        }
         echo "{\"type\":\"REPORT\",\"from\":\"$sender\",\"message\":\"$message\",\"ts\":$(date +%s)}" >> "$INBOX_DIR/${operator_session}-results.jsonl"
         echo "Report queued for $operator_session (check with: mob results)"
     else
@@ -595,10 +641,10 @@ get_heartbeat_status() {
 
 crash_handler() {
     local crashed_session="$1"
+    local namespace=$(_extract_namespace "$crashed_session")
     local coord_session
     coord_session=$(tmux list-sessions -F "#{session_name}" 2>/dev/null \
-        | grep "^${SESSION_PREFIX}-coord" \
-        | head -1 || true)
+        | grep "^${SESSION_PREFIX}-coord-${namespace}$" | head -1 || true)
 
     if [[ -z "$coord_session" ]]; then
         echo "Worker $crashed_session crashed (no coordinator to notify)" >&2
@@ -679,11 +725,15 @@ get_session_health() {
 }
 
 health() {
+    local namespace="${1:-}"
+    local pattern="^${SESSION_PREFIX}-"
+    [[ -n "$namespace" ]] && pattern="${pattern}[^-]*-${namespace}"
+
     local sessions
-    sessions=$(tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+    sessions=$(tmux list-sessions -F "#{session_name}|#{session_created}" 2>/dev/null | grep "$pattern" || true)
 
     if [[ -z "$sessions" ]]; then
-        echo "No claude sessions running"
+        echo "No claude sessions running${namespace:+ for namespace: $namespace}"
         return 0
     fi
 
@@ -822,18 +872,31 @@ kill_all() {
 attach() {
     local session="$1"
 
-    if ! tmux has-session -t "$session" 2>/dev/null; then
-        echo "Session $session does not exist" >&2
-        return 1
+    if tmux has-session -t "$session" 2>/dev/null; then
+        tmux attach -t "$session"
+        return 0
     fi
 
-    tmux attach -t "$session"
+    local operator_session="${SESSION_PREFIX}-operator-${session}"
+    if tmux has-session -t "$operator_session" 2>/dev/null; then
+        tmux attach -t "$operator_session"
+        return 0
+    fi
+
+    echo "Session $session does not exist" >&2
+    echo "Tip: 'mob attach api' attaches to claude-operator-api" >&2
+    return 1
 }
 
 start() {
-    local id="${1:-$(date +%s)}"
-    local coord_name="${SESSION_PREFIX}-coord-${id}"
-    local operator_name="${SESSION_PREFIX}-operator-${id}"
+    local namespace="${1:-}"
+    if [[ -z "$namespace" ]]; then
+        echo "Usage: mob start <namespace>" >&2
+        echo "Example: mob start api" >&2
+        return 1
+    fi
+    local coord_name="${SESSION_PREFIX}-coord-${namespace}"
+    local operator_name="${SESSION_PREFIX}-operator-${namespace}"
 
     if tmux has-session -t "$coord_name" 2>/dev/null; then
         echo "Session $coord_name already exists" >&2
@@ -958,14 +1021,19 @@ logs() {
 }
 
 listen() {
+    local namespace="${1:-}"
     mkdir -p "$INBOX_DIR"
 
-    echo "Listening for mob messages... (Ctrl+C to stop)"
+    echo "Listening for mob messages${namespace:+ (namespace: $namespace)}... (Ctrl+C to stop)"
     echo "---"
 
-    touch "$INBOX_DIR/.listen-probe"
+    local pattern="*.jsonl"
+    [[ -n "$namespace" ]] && pattern="*${namespace}*.jsonl"
 
-    tail -F "$INBOX_DIR"/*.jsonl 2>/dev/null | while read -r line; do
+    local probe_file="$INBOX_DIR/_listen-${namespace:-all}.jsonl"
+    touch "$probe_file"
+
+    tail -F "$INBOX_DIR"/$pattern 2>/dev/null | while read -r line; do
         [[ -z "$line" ]] && continue
         [[ "$line" == *"==>"* ]] && continue
 
@@ -991,11 +1059,14 @@ listen() {
 }
 
 waiting() {
+    local namespace="${1:-}"
+    local pattern="^${SESSION_PREFIX}-"
+    [[ -n "$namespace" ]] && pattern="${pattern}[^-]*-${namespace}"
+
     local sessions
-    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
+    sessions=$(tmux list-sessions -F "#{session_name}" 2>/dev/null | grep "$pattern" || true)
 
     if [[ -z "$sessions" ]]; then
-        echo "No claude sessions running"
         return 0
     fi
 
@@ -1020,15 +1091,16 @@ waiting() {
 }
 
 watch() {
+    local namespace="${1:-}"
     trap 'echo ""; exit 0' INT
     while true; do
         clear
-        echo "=== MOB WATCH === $(date '+%H:%M:%S') ==="
+        echo "=== MOB WATCH${namespace:+ ($namespace)} === $(date '+%H:%M:%S') ==="
         echo ""
-        health
+        health "$namespace"
         echo ""
         local waiting_output
-        waiting_output=$(waiting)
+        waiting_output=$(waiting "$namespace")
         if [[ -n "$waiting_output" ]]; then
             echo "WAITING FOR INPUT:"
             echo "$waiting_output"
@@ -1048,26 +1120,27 @@ ARCHITECTURE:
     - Coordinator: Background orchestrator. Manages all workers.
     - Workers: Do the actual work (write code, research, etc.)
 
+NAMESPACES:
+    Run multiple isolated mobs with namespaces:
+    - mob start api         → claude-coord-api, claude-operator-api
+    - mob start web         → claude-coord-web, claude-operator-web
+    Workers auto-inherit namespace: claude-worker-api_1, claude-worker-web_1
+
 USAGE:
     mob <command> [args]
 
 COMMANDS:
-    start [id]              Start operator + coordinator, attach to operator
-                            This is the quickest way to begin
+    start <namespace>       Start operator + coordinator with namespace
+                            Example: mob start api
 
     spawn <role> [id]       Create session and auto-prime based on role
                             Roles: operator, coord, worker, researcher, reviewer, planner
-                            - operator: user interface (opus)
-                            - coord: background orchestrator (sonnet)
-                            - worker: full tools (read/write/bash)
-                            - researcher: read-only (explore code, no edits)
-                            - reviewer: read + test/lint commands
-                            - planner: read-only with opus model
 
     spawn-quiet <role> [id] Create session WITHOUT auto-priming
 
     dispatch <role> <id> <task>
                             Spawn worker AND send task in one command
+                            Worker inherits caller's namespace automatically
                             Example: dispatch worker 1 "Build the auth module"
 
     list                    List all claude-* sessions
@@ -1083,8 +1156,9 @@ COMMANDS:
     peek <session> [lines]  Show last N lines from session (default: 30)
     logs <session> [lines]  Show session log file (optional: last N lines)
     waiting                 Show sessions waiting for input/permission
-    watch                   Live dashboard with auto-refresh (Ctrl+C to exit)
-    listen                  Stream all inbox messages in real-time
+    watch [namespace]       Live dashboard (Ctrl+C to exit)
+    listen [namespace]      Stream inbox messages in real-time
+    health [namespace]      Show health status with heartbeat freshness
 
     attach <session>        Attach to a session (detach: Ctrl-b d)
 
@@ -1092,7 +1166,6 @@ COMMANDS:
     killall                 Kill all claude-* sessions
 
 HEALTH MONITORING:
-    health                  Show health status with heartbeat freshness
     zombies                 List zombie sessions (Claude died but tmux persists)
     reap                    Kill all zombie sessions
 
@@ -1112,18 +1185,17 @@ WORKER CALLBACKS (run from within a worker session):
     heartbeat               Record heartbeat (proves worker is alive)
 
 EXAMPLES:
-    # === QUICK START ===
-    mob start                          # Spawns operator + coordinator, attaches to operator
+    # === QUICK START (namespaced) ===
+    mob start api                      # Start mob for "api" work
+    mob start web                      # Start separate mob for "web" work
+
+    # === MONITOR SPECIFIC NAMESPACE ===
+    mob watch api                      # Dashboard for api namespace only
+    mob listen api                     # Stream api messages only
+    mob health api                     # Health for api sessions only
 
     # === FROM OPERATOR: send task to coordinator ===
     mob task "Build a REST API with /users and /posts endpoints"
-
-    # === FROM OPERATOR: check coordinator's reports ===
-    mob results
-
-    # === MONITOR ===
-    mob health
-    mob peek claude-coord-*            # See coordinator activity
 
     # === CLEANUP ===
     mob killall
@@ -1192,10 +1264,10 @@ main() {
             waiting
             ;;
         watch)
-            watch
+            watch "$@"
             ;;
         listen)
-            listen
+            listen "$@"
             ;;
         attach)
             [[ $# -lt 1 ]] && { echo "Usage: attach <session>" >&2; exit 1; }
@@ -1209,7 +1281,7 @@ main() {
             kill_all
             ;;
         health)
-            health
+            health "$@"
             ;;
         zombies)
             zombies
