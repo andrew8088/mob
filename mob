@@ -11,10 +11,10 @@ LOCK_DIR="/tmp/mob-locks"
 LOG_DIR="/tmp/mob-logs"
 INBOX_DIR="/tmp/mob-inbox"
 
-WORKER_TOOLS='Read,Write,Edit,Glob,Grep,Bash(git:*,npm:*,npx:*,pnpm:*,yarn:*,make:*,jest:*,vitest:*,pytest:*,cargo:*),WebSearch,WebFetch,Task,TodoWrite'
-REVIEWER_TOOLS='Read,Glob,Grep,Bash(git:*,npm:test,npm:lint,npx:*,pnpm:test,pnpm:lint,yarn:test,yarn:lint,make:test,make:lint,jest:*,vitest:*,pytest:*,cargo:test,cargo:clippy),WebSearch,WebFetch,Task,TodoWrite'
-RESEARCHER_TOOLS='Read,Glob,Grep,WebSearch,WebFetch,Task,TodoWrite'
-PLANNER_TOOLS='Read,Glob,Grep,WebSearch,WebFetch,Task,TodoWrite'
+WORKER_TOOLS='Read,Write,Edit,Glob,Grep,Bash(mob:*,git:*,npm:*,npx:*,pnpm:*,yarn:*,make:*,jest:*,vitest:*,pytest:*,cargo:*),WebSearch,WebFetch,Task,TodoWrite'
+REVIEWER_TOOLS='Read,Glob,Grep,Bash(mob:*,git:*,npm:test,npm:lint,npx:*,pnpm:test,pnpm:lint,yarn:test,yarn:lint,make:test,make:lint,jest:*,vitest:*,pytest:*,cargo:test,cargo:clippy),WebSearch,WebFetch,Task,TodoWrite'
+RESEARCHER_TOOLS='Read,Glob,Grep,Bash(mob:*),WebSearch,WebFetch,Task,TodoWrite'
+PLANNER_TOOLS='Read,Glob,Grep,Bash(mob:*),WebSearch,WebFetch,Task,TodoWrite'
 
 read -r -d '' COORD_PROMPT << 'EOF' || true
 You are a **coordinator** managing Claude Code workers via `mob`. Your job:
