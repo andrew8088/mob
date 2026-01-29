@@ -513,6 +513,31 @@ attach() {
     tmux attach -t "$session"
 }
 
+start() {
+    local id="${1:-$(date +%s)}"
+    local name="${SESSION_PREFIX}-coord-${id}"
+
+    if tmux has-session -t "$name" 2>/dev/null; then
+        echo "Session $name already exists" >&2
+        return 1
+    fi
+
+    mkdir -p "$LOG_DIR"
+    tmux new-session -d -s "$name"
+    sleep 0.2
+    tmux pipe-pane -t "$name" -o "cat >> '$LOG_DIR/$name.log'"
+    tmux send-keys -t "$name" "claude" Enter
+
+    echo "Waiting ${PRIME_DELAY}s for Claude to start..."
+    sleep "$PRIME_DELAY"
+    tmux send-keys -t "$name" -l "$COORD_PROMPT"
+    sleep 0.3
+    tmux send-keys -t "$name" Enter
+    echo "$name (primed as coordinator)"
+
+    tmux attach -t "$name"
+}
+
 status() {
     local sessions
     sessions=$(tmux list-sessions -F "#{session_name}|#{session_created}|#{session_attached}" 2>/dev/null | grep "^${SESSION_PREFIX}-" || true)
@@ -648,6 +673,9 @@ USAGE:
     mob <command> [args]
 
 COMMANDS:
+    start [id]              Start coordinator and attach to it
+                            This is the quickest way to begin
+
     spawn <role> [id]       Create session and auto-prime based on role
                             Roles: coord, worker (auto-primed)
                             Other roles spawn without priming
@@ -689,7 +717,7 @@ WORKER CALLBACKS (run from within a worker session):
 
 EXAMPLES:
     # === QUICK START ===
-    mob spawn coord                    # Spawns + primes coordinator
+    mob start                          # Start coordinator and attach
     mob spawn worker 1                 # Spawns + primes worker
     mob spawn worker 2
 
@@ -805,6 +833,9 @@ main() {
         crash)
             [[ $# -lt 1 ]] && { echo "Usage: crash <session>" >&2; exit 1; }
             crash_handler "$1"
+            ;;
+        start)
+            start "$@"
             ;;
         help|--help|-h)
             usage
