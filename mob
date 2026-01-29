@@ -9,6 +9,7 @@ HEARTBEAT_STALE=900   # 15 minutes - heartbeat considered stale
 HEARTBEAT_DIR="/tmp/mob-heartbeats"
 LOCK_DIR="/tmp/mob-locks"
 LOG_DIR="/tmp/mob-logs"
+INBOX_DIR="/tmp/mob-inbox"
 
 WORKER_TOOLS='Read,Write,Edit,Glob,Grep,Bash(git:*,npm:*,npx:*,pnpm:*,yarn:*,make:*,jest:*,vitest:*,pytest:*,cargo:*),WebSearch,WebFetch,Task,TodoWrite'
 REVIEWER_TOOLS='Read,Glob,Grep,Bash(git:*,npm:test,npm:lint,npx:*,pnpm:test,pnpm:lint,yarn:test,yarn:lint,make:test,make:lint,jest:*,vitest:*,pytest:*,cargo:test,cargo:clippy),WebSearch,WebFetch,Task,TodoWrite'
@@ -21,8 +22,9 @@ You are a **coordinator** managing Claude Code workers via `mob`. Your job:
 2. Choose the right worker type for each subtask
 3. Spawn workers: `mob spawn <type> <id>`
 4. Dispatch work: `mob send claude-<type>-<id> "<task>. When done: mob done '<summary>'"`
-5. Watch for callbacks: [DONE from ...], [REPORT from ...], [QUESTION from ...]
-6. Synthesize results when all workers complete
+5. Check inbox periodically: `mob inbox` (workers queue completions here)
+6. Handle interrupts: [QUESTION from ...] and [CRASH from ...] appear immediately
+7. Synthesize results when all workers complete
 
 Worker types (choose based on task):
 - researcher: understand code, find patterns, explore (read-only, safe to spawn liberally)
@@ -37,7 +39,7 @@ Patterns:
 - Refactor → planner → worker(s) → reviewer
 - PR review → reviewer
 
-Commands: `mob spawn <type> <id>`, `mob send <session> <msg>`, `mob workers`, `mob kill <session>`
+Commands: `mob spawn <type> <id>`, `mob send <session> <msg>`, `mob inbox`, `mob workers`, `mob kill <session>`
 
 Keep tasks independent where possible. Always tell workers to run `mob done` when finished.
 EOF
@@ -261,11 +263,10 @@ report() {
     local sender
     sender=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
 
-    tmux send-keys -t "$coord_session" -l "[REPORT from $sender] $message"
-    sleep 0.3
-    tmux send-keys -t "$coord_session" Enter
+    mkdir -p "$INBOX_DIR"
+    echo "{\"type\":\"REPORT\",\"from\":\"$sender\",\"message\":\"$message\",\"ts\":$(date +%s)}" >> "$INBOX_DIR/$coord_session.jsonl"
 
-    echo "Reported to $coord_session"
+    echo "Report queued for $coord_session (check with: mob inbox)"
 }
 
 done_task() {
@@ -288,11 +289,10 @@ done_task() {
         return 1
     }
 
-    tmux send-keys -t "$coord_session" -l "[DONE from $sender] $task_summary"
-    sleep 0.3
-    tmux send-keys -t "$coord_session" Enter
+    mkdir -p "$INBOX_DIR"
+    echo "{\"type\":\"DONE\",\"from\":\"$sender\",\"message\":\"$task_summary\",\"ts\":$(date +%s)}" >> "$INBOX_DIR/$coord_session.jsonl"
 
-    echo "Completion reported to $coord_session"
+    echo "Completion queued for $coord_session (check with: mob inbox)"
 
     sleep 1
     tmux kill-session -t "$sender" 2>/dev/null &
@@ -313,7 +313,64 @@ ask_coord() {
     sleep 0.3
     tmux send-keys -t "$coord_session" Enter
 
-    echo "Question sent to $coord_session"
+    echo "Question sent to $coord_session (interrupt)"
+}
+
+inbox() {
+    local coord_session
+    coord_session=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    if [[ "$coord_session" != "${SESSION_PREFIX}-coord"* ]]; then
+        coord_session=$(coord 2>/dev/null) || {
+            echo "No coordinator found" >&2
+            return 1
+        }
+    fi
+
+    local inbox_file="$INBOX_DIR/$coord_session.jsonl"
+
+    if [[ ! -f "$inbox_file" ]] || [[ ! -s "$inbox_file" ]]; then
+        echo "No messages in inbox"
+        return 0
+    fi
+
+    local count
+    count=$(wc -l < "$inbox_file" | tr -d ' ')
+    echo "=== INBOX ($count messages) ==="
+    echo ""
+
+    while IFS= read -r line; do
+        local msg_type msg_from msg_text
+        msg_type=$(echo "$line" | sed -n 's/.*"type":"\([^"]*\)".*/\1/p')
+        msg_from=$(echo "$line" | sed -n 's/.*"from":"\([^"]*\)".*/\1/p')
+        msg_text=$(echo "$line" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+        echo "[$msg_type from $msg_from] $msg_text"
+    done < "$inbox_file"
+
+    rm -f "$inbox_file"
+    echo ""
+    echo "--- Inbox cleared ---"
+}
+
+inbox_count() {
+    local coord_session
+    coord_session=$(tmux display-message -p "#{session_name}" 2>/dev/null || echo "unknown")
+
+    if [[ "$coord_session" != "${SESSION_PREFIX}-coord"* ]]; then
+        coord_session=$(coord 2>/dev/null) || {
+            echo "0"
+            return 0
+        }
+    fi
+
+    local inbox_file="$INBOX_DIR/$coord_session.jsonl"
+
+    if [[ ! -f "$inbox_file" ]] || [[ ! -s "$inbox_file" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    wc -l < "$inbox_file" | tr -d ' '
 }
 
 heartbeat() {
@@ -798,10 +855,17 @@ HEALTH MONITORING:
     zombies                 List zombie sessions (Claude died but tmux persists)
     reap                    Kill all zombie sessions
 
+INBOX (non-interruptive message queue):
+    inbox                   Read and clear pending messages from workers
+    inbox-count             Show count of pending messages (for scripts)
+
+    Workers use `mob done` and `mob report` to queue messages.
+    Only `mob ask` (questions) and crashes interrupt immediately.
+
 WORKER CALLBACKS (run from within a worker session):
-    report <msg>            Send status report to coordinator
-    done <summary>          Signal task completion to coordinator
-    ask <question>          Ask coordinator a question
+    report <msg>            Queue status report for coordinator
+    done <summary>          Queue completion and self-terminate
+    ask <question>          Interrupt coordinator with question
     heartbeat               Record heartbeat (proves worker is alive)
 
 EXAMPLES:
@@ -915,6 +979,12 @@ main() {
         ask)
             [[ $# -lt 1 ]] && { echo "Usage: ask <question>" >&2; exit 1; }
             ask_coord "$@"
+            ;;
+        inbox)
+            inbox
+            ;;
+        inbox-count)
+            inbox_count
             ;;
         heartbeat)
             heartbeat
