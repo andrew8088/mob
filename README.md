@@ -1,28 +1,43 @@
 # mob
 
-Orchestrate multiple Claude Code sessions as a coordinated swarm. One coordinator breaks down tasks and dispatches work to specialized workers running in parallel.
+Orchestrate multiple Claude Code sessions as a coordinated swarm. An operator shields you from noise, a coordinator breaks down tasks, and specialized workers execute in parallel.
 
 ## Quick Start
 
 ```bash
-# Start a coordinator and attach to it
-mob start
+# Start a namespaced mob (operator + coordinator)
+mob start api
 
-# From another terminal, spawn workers
-mob spawn worker 1
-mob spawn researcher 2
+# You're now in the operator session
+# Send work to the coordinator:
+mob task "Build a REST API with /users and /posts endpoints"
+
+# Check coordinator reports:
+mob results
+
+# In another terminal, watch the swarm:
+mob watch api
 ```
-
-The coordinator receives a prompt explaining how to manage workers. Ask it to do something complex and it will break it down, spawn the right worker types, and synthesize results.
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│   Coordinator   │  Full Claude, breaks down tasks
-│  claude-coord-* │  Chooses worker types, dispatches work, synthesizes results
-└────────┬────────┘
-         │ mob send
+┌──────────┐
+│   You    │
+└────┬─────┘
+     │ mob task / mob results
+     ▼
+┌──────────────────┐
+│    Operator      │  opus model, shields you from worker noise
+│ claude-operator-*│  Sends tasks, receives synthesized reports
+└────────┬─────────┘
+         │ priority inbox / reports
+         ▼
+┌──────────────────┐
+│   Coordinator    │  sonnet model, orchestrates workers
+│  claude-coord-*  │  Breaks down tasks, dispatches, synthesizes
+└────────┬─────────┘
+         │ mob dispatch
     ┌────┴────┬─────────┬─────────┐
     ▼         ▼         ▼         ▼
 ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
@@ -30,54 +45,68 @@ The coordinator receives a prompt explaining how to manage workers. Ask it to do
 │read-only│ │ opus   │ │ full   │ │test/lint│
 └────────┘ └────────┘ └────────┘ └────────┘
     │         │         │         │
-    └────┬────┴─────────┴────┬────┘
-         │                   │
-    ┌────┴────┐         ┌────┴────┐
-    ▼ queued  ▼         ▼interrupt▼
-┌─────────────────┐ ┌─────────────────┐
-│  mob inbox      │ │ [QUESTION ...]  │
-│  (done/report)  │ │ [CRASH ...]     │
-└─────────────────┘ └─────────────────┘
+    └─────────┴────┬────┴─────────┘
+                   │ mob done / mob report
+                   ▼
+           ┌──────────────┐
+           │ worker inbox │
+           │ (queued)     │
+           └──────────────┘
+```
+
+## Namespaces
+
+Run multiple isolated mobs simultaneously:
+
+```bash
+mob start api      # Creates claude-coord-api, claude-operator-api
+mob start web      # Creates claude-coord-web, claude-operator-web
+```
+
+Workers auto-inherit their coordinator's namespace:
+- `mob dispatch worker 1` from coord-api → `claude-worker-api_1`
+
+Filter commands by namespace:
+```bash
+mob watch api      # Dashboard for api namespace only
+mob listen api     # Stream api messages only
+mob health api     # Health for api sessions only
 ```
 
 ## Worker Types
 
-The coordinator automatically chooses the right worker type based on the task:
-
 | Type | Model | Tools | Use Case |
 |------|-------|-------|----------|
-| `researcher` | sonnet | read-only (Glob, Grep, Read, Web) | Explore code, find patterns, understand systems |
-| `planner` | **opus** | read-only | Architecture decisions, complex problem decomposition |
-| `worker` | sonnet | full (read/write/bash) | Implementation, bug fixes, refactoring |
-| `reviewer` | sonnet | read + test/lint | Code review, validation, running tests |
+| `researcher` | sonnet | read-only (Glob, Grep, Read, Web) | Explore code, find patterns |
+| `planner` | **opus** | read-only | Architecture, complex decomposition |
+| `worker` | sonnet | full (read/write/bash) | Implementation, bug fixes |
+| `reviewer` | sonnet | read + test/lint | Code review, validation |
 
 **Common patterns:**
 - Simple bug fix → `worker`
 - New feature → `researcher` → `planner` → `worker(s)` → `reviewer`
 - Code question → `researcher`
-- Refactor → `planner` → `worker(s)` → `reviewer`
-- PR review → `reviewer`
 
-## Inbox System
+## Message Flow
 
-Worker callbacks are **queued** by default to avoid interrupting the coordinator mid-thought:
+### Operator ↔ Coordinator
 
-| Callback | Delivery | Behavior |
-|----------|----------|----------|
-| `mob done` | queued | Writes to inbox, worker self-terminates |
-| `mob report` | queued | Writes to inbox |
-| `mob ask` | **interrupt** | Injects directly into coordinator |
-| crash | **interrupt** | Injects directly into coordinator |
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `mob task <msg>` | operator → coord | Send priority task (interrupts) |
+| `mob priority` | coord reads | Check priority inbox |
+| `mob report <msg>` | coord → operator | Send report |
+| `mob results` | operator reads | Check coordinator reports |
 
-The coordinator checks messages when ready:
+### Coordinator ↔ Workers
 
-```bash
-mob inbox
-# === INBOX (2 messages) ===
-# [DONE from claude-worker-1] Built REST API with CRUD endpoints
-# [DONE from claude-researcher-2] Found auth patterns in src/auth/
-# --- Inbox cleared ---
-```
+| Command | Direction | Description |
+|---------|-----------|-------------|
+| `mob dispatch <type> <id> <task>` | coord → worker | Spawn and send task |
+| `mob done <summary>` | worker → coord | Queue completion (auto-terminates) |
+| `mob report <msg>` | worker → coord | Queue status update |
+| `mob ask <question>` | worker → coord | Interrupt with question |
+| `mob inbox` | coord reads | Check worker messages |
 
 ## Commands
 
@@ -85,9 +114,10 @@ mob inbox
 
 | Command | Description |
 |---------|-------------|
-| `mob start [id]` | Start coordinator and attach |
-| `mob spawn <type> [id]` | Spawn a worker (type: worker, researcher, reviewer, planner) |
-| `mob attach <session>` | Attach to a session (detach: Ctrl-b d) |
+| `mob start <namespace>` | Start operator + coordinator, attach to operator |
+| `mob spawn <type> [id]` | Spawn session (coord, operator, worker, researcher, reviewer, planner) |
+| `mob dispatch <type> <id> <task>` | Spawn worker and send task in one command |
+| `mob attach <session>` | Attach to session (`mob attach api` → operator) |
 | `mob kill <session>` | Kill a session |
 | `mob killall` | Kill all mob sessions |
 
@@ -96,32 +126,11 @@ mob inbox
 | Command | Description |
 |---------|-------------|
 | `mob list` | List all sessions |
-| `mob workers` | List workers only |
-| `mob status` | Detailed session status |
-| `mob health` | Health status with heartbeat info |
-| `mob watch` | Live dashboard (Ctrl+C to exit) |
+| `mob health [namespace]` | Health status with heartbeat info |
+| `mob watch [namespace]` | Live dashboard (Ctrl+C to exit) |
+| `mob listen [namespace]` | Stream inbox messages in real-time |
 | `mob peek <session> [n]` | Last n lines from session |
-| `mob logs <session> [n]` | Session log file |
 | `mob waiting` | Sessions awaiting input |
-
-### Communication
-
-| Command | Description |
-|---------|-------------|
-| `mob send <session> <msg>` | Send message to session |
-| `mob broadcast <msg>` | Send to all sessions |
-| `mob broadcast-workers <msg>` | Send to workers only |
-| `mob inbox` | Read and clear pending messages |
-| `mob inbox-count` | Count of pending messages |
-
-### Worker Callbacks (run from within worker)
-
-| Command | Description |
-|---------|-------------|
-| `mob done <summary>` | Queue completion (auto-terminates worker) |
-| `mob report <msg>` | Queue status update |
-| `mob ask <question>` | Interrupt coordinator with question |
-| `mob heartbeat` | Record heartbeat |
 
 ### Health Management
 
@@ -130,46 +139,43 @@ mob inbox
 | `mob zombies` | List zombie sessions |
 | `mob reap` | Kill all zombies |
 
-## Worker Security
-
-Workers run with restricted permissions:
-
-| Type | Model | Bash Access |
-|------|-------|-------------|
-| worker | sonnet | git, npm, npx, pnpm, yarn, make, jest, vitest, pytest, cargo |
-| researcher | sonnet | none |
-| reviewer | sonnet | git, test/lint commands only |
-| planner | opus | none |
-
-All workers run with `--dangerously-skip-permissions` (auto-approved) and no hooks.
-
 ## Example Session
 
 ```bash
-# Terminal 1: Start coordinator
-mob start
+# Terminal 1: Start the swarm
+mob start api
 
-# Ask coordinator:
+# You're now in the operator. Ask for something:
 # "Add user authentication to this Express app"
 
+# The operator sends to coordinator:
+mob task "Add user authentication to this Express app"
+
 # Coordinator will:
-# 1. Spawn researcher to understand existing code
-# 2. Spawn planner to design the auth system
-# 3. Spawn workers to implement
-# 4. Spawn reviewer to validate
-# 5. Check mob inbox between phases
-# 6. Synthesize final result
+# 1. Check mob priority (gets your task)
+# 2. Dispatch researcher to understand code
+# 3. Dispatch planner to design auth
+# 4. Dispatch workers to implement
+# 5. Dispatch reviewer to validate
+# 6. Report back to operator
+
+# Check reports:
+mob results
 
 # Terminal 2: Monitor
-mob watch
+mob watch api
+
+# Terminal 3: Stream messages
+mob listen api
 ```
 
 ## How It Works
 
 - Sessions run in tmux (source of truth for liveness)
 - Messages sent via `tmux send-keys` with per-session locking
-- Completions queue to `/tmp/mob-inbox/` (non-interruptive)
-- Questions and crashes interrupt immediately
+- Worker completions queue to `/tmp/mob-inbox/{coord}.jsonl`
+- Operator tasks queue to `/tmp/mob-inbox/{coord}-priority.jsonl`
+- Coordinator reports queue to `/tmp/mob-inbox/{operator}-results.jsonl`
 - Crash detection via tmux `pane-died` hooks
 - Logs persisted to `/tmp/mob-logs/`
 
